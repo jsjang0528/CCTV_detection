@@ -10,5 +10,7 @@ dependencies:
     - pillow
     - scikit-learn
     - ultralytics
+    - albumentations
     - tqdm
     - matplotlib
+    - pandas
