@@ -100,7 +100,7 @@ def create_yolo_labels(img_dir, json_dir, out_dir, overwrite=False):
         "경찰차": 5,
         "구급차": 6,
         "소방차": 7,
-        "건인차": 8,
+        "견인차": 8,
         "기타 특장차": 9,
         "성인": 10,
         "어린이": 11,
