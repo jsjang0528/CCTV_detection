@@ -1,0 +1,16 @@
+name: cctv_env
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - numpy
+    - opencv-python
+    - pillow
+    - scikit-learn
+    - ultralytics
+    - albumentations
+    - tqdm
+    - matplotlib
+    - pandas

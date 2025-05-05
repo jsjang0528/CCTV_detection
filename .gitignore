@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# 데이터 폴더
+data/
+
+.DS_Store
