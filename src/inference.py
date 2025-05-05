@@ -131,7 +131,7 @@ def inference_yolo(yolo_model, test_dir, out_label_dir=None):
     return out_label_dir
 
 
-def generate_prediction(model_type, model, test_dir, out_label_dir=None):
+def generate_prediction(model, test_dir, out_label_dir=None):
     """
     지정된 모델을 사용하여 테스트 이미지에서 객체를 감지하고 결과를 YOLO 형식으로 저장합니다.
 
