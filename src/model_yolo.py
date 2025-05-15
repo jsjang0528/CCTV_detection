@@ -1,4 +1,5 @@
 import os
+import cv2
 
 from ultralytics import YOLO
 
@@ -89,10 +90,14 @@ class YOLOModel:
         self,
         train_dir,
         val_dir=None,
-        epochs=5,
+        epochs=50,
         device=None,
         class_names=None,
         force_retrain=False,
+        img_size=640,
+        batch_size=None,
+        project="runs/detect",
+        name="train",
     ):
         """
         YOLO 모델을 커스텀 클래스로 학습합니다.
@@ -100,17 +105,21 @@ class YOLOModel:
         매개변수:
             train_dir (str): 학습 데이터 디렉토리 경로
             val_dir (str): 검증 데이터 디렉토리 경로
-            epochs (int): 학습 에폭 수
+            epochs (int): 학습 에포크 수
             device (str): 학습 장치 ('cpu' 또는 'cuda')
             class_names (list): 사용자 정의 클래스 이름 목록
-            force_retrain (bool): True면 이미 학습된 모델이 있어도 재학습 실행
+            force_retrain (bool): 이미 학습된 모델이 있어도 재학습 실행 여부
+            img_size (int): 이미지 크기
+            batch_size (int): 배치 크기
+            project (str): 프로젝트 경로
+            name (str): 학습 이름
         """
         try:
             import torch
             from ultralytics import YOLO
 
             # 이미 학습된 모델 확인
-            best_weight_path = os.path.join("runs/detect/train/weights", "best.pt")
+            best_weight_path = os.path.join(project, name, "weights", "best.pt")
             if os.path.exists(best_weight_path) and not force_retrain:
                 print(
                     f"[YOLOModel] 이미 학습된 모델이 발견되었습니다: {best_weight_path}"
@@ -145,14 +154,20 @@ class YOLOModel:
             # YOLO 모델 로드 (기존 가중치에서 시작)
             self.model = YOLO(self.model_name)
 
-            # 학습 실행
+            # 배치 크기 설정
+            if batch_size is None:
+                batch_size = 8 if device == "cuda" else 4
+
+            # 학습 실행 - 프로젝트/이름 설정 추가
             results = self.model.train(
                 data=yaml_path,
                 epochs=epochs,
-                imgsz=640,
-                batch=8 if device == "cuda" else 4,
+                imgsz=img_size,
+                batch=batch_size,
                 device=device,
                 verbose=True,
+                project=project,
+                name=name,
             )
 
             # 학습된 모델 저장 경로
@@ -272,3 +287,49 @@ class YOLOModel:
         self.model = YOLO(path)
         self.best_weight = path
         print(f"[YOLOModel.load] 모델 로드 완료: {path}")
+
+def ensemble_predict(models, img):
+    """여러 모델의 예측을 결합"""
+    all_boxes = []
+    for model in models:
+        boxes = model.predict(img, conf_thresh=0.2)  # 낮은 임계값 사용
+        all_boxes.extend(boxes)
+    
+    # NMS로 중복 박스 제거
+    final_boxes = non_max_suppression(all_boxes, iou_threshold=0.5)
+    return final_boxes
+
+# 다양한 모델 학습 (크기, 하이퍼파라미터, 훈련 데이터 다르게)
+models = []
+for size in ['n', 's', 'm']:
+    model = train_model(train_dir, val_dir, model_size=size, ...)
+    models.append(model)
+
+# 앙상블 예측
+results = ensemble_predict(models, test_image)
+
+def test_time_augmentation(model, img, augment_count=5):
+    """테스트 시 이미지 증강하여 예측 결과 개선"""
+    # 원본 이미지 예측
+    boxes = model.predict(img)
+    
+    # 다양한 증강 적용
+    augmentations = [
+        lambda x: cv2.flip(x, 1),  # 좌우 반전
+        lambda x: cv2.resize(x, (int(x.shape[1]*0.8), int(x.shape[0]*0.8))),  # 축소
+        # 기타 증강...
+    ]
+    
+    all_boxes = boxes.copy()
+    for aug_func in augmentations:
+        # 증강 적용
+        aug_img = aug_func(img.copy())
+        # 예측
+        aug_boxes = model.predict(aug_img)
+        # 원본 이미지 좌표로 변환 (증강 반대 작업)
+        transformed_boxes = transform_boxes(aug_boxes, img.shape, aug_img.shape)
+        all_boxes.extend(transformed_boxes)
+    
+    # NMS로 중복 박스 제거
+    final_boxes = non_max_suppression(all_boxes, iou_threshold=0.5)
+    return final_boxes
