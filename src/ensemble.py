@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import os
+from .model_yolo import YOLOModel
 
 def non_max_suppression(boxes, iou_threshold=0.5, conf_threshold=0.25):
     """중복 박스를 제거하는 NMS 알고리즘"""
@@ -192,3 +193,149 @@ def visualize_detection(img, boxes, class_names=None, save_path=None):
         print(f"시각화된 이미지 저장됨: {save_path}")
     
     return img_copy
+
+def run_ensemble():
+    print("\n=== 앙상블 모델 실행 ===")
+    # 여러 크기의 모델 로드
+    models = []
+    
+    # 여러 모델 로드 (예: nano와 small 모델)
+    model_sizes = ['n', 's']  # 사용 가능한 모델 크기
+    for size in model_sizes:
+        model_path = f"runs/detect/train_{size}/weights/best.pt"
+        if os.path.exists(model_path):
+            print(f"모델 로드 중: {model_path}")
+            model = YOLOModel()
+            model.load(model_path)
+            models.append(model)
+        else:
+            print(f"모델 파일을 찾을 수 없음: {model_path}")
+    
+    if not models:
+        print("사용 가능한 모델이 없습니다. 확인 후 다시 시도하세요.")
+        return
+    
+    # 테스트 이미지 선택 (첫 번째 테스트 이미지 사용)
+    test_img_files = os.listdir("data/test/images")
+    test_img_files = [f for f in test_img_files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    if not test_img_files:
+        print("테스트 이미지를 찾을 수 없습니다.")
+        return
+        
+    test_img_path = os.path.join("data/test/images", test_img_files[0])
+    print(f"테스트 이미지: {test_img_path}")
+    
+    img = cv2.imread(test_img_path)
+    ensemble_boxes = ensemble_predict(models, img)
+    
+    # 결과 시각화
+    class_names = [
+        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
+        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
+        "견인차", "기타 특장차", "성인", "어린이",
+        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
+    ]
+    
+    vis_img = visualize_detection(
+        img, ensemble_boxes, class_names, 
+        save_path="ensemble_result.jpg"
+    )
+    print(f"앙상블 결과: {len(ensemble_boxes)}개 객체 감지됨, 결과 이미지: ensemble_result.jpg")
+    return ensemble_boxes
+
+def run_tta(model=None):
+    """테스트 시간 증강(TTA) 실행 예시"""
+    print("\n=== 테스트 시간 증강(TTA) 실행 ===")
+    
+    # 모델이 전달되지 않았으면 로드
+    if model is None:
+        model_path = "runs/detect/train/weights/best.pt"
+        if not os.path.exists(model_path):
+            print(f"모델 파일을 찾을 수 없음: {model_path}")
+            return
+            
+        model = YOLOModel()
+        model.load(model_path)
+    
+    # 테스트 이미지 선택 (첫 번째 테스트 이미지 사용)
+    test_img_files = os.listdir("data/test/images")
+    test_img_files = [f for f in test_img_files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    if not test_img_files:
+        print("테스트 이미지를 찾을 수 없습니다.")
+        return
+        
+    test_img_path = os.path.join("data/test/images", test_img_files[0])
+    print(f"테스트 이미지: {test_img_path}")
+    
+    img = cv2.imread(test_img_path)
+    tta_boxes = test_time_augmentation(model, img)
+    
+    # 결과 시각화
+    class_names = [
+        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
+        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
+        "견인차", "기타 특장차", "성인", "어린이",
+        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
+    ]
+    
+    vis_img = visualize_detection(
+        img, tta_boxes, class_names, 
+        save_path="tta_result.jpg"
+    )
+    print(f"TTA 결과: {len(tta_boxes)}개 객체 감지됨, 결과 이미지: tta_result.jpg")
+    return tta_boxes
+
+def run_ensemble_on_directory(input_dir, output_dir):
+    """디렉토리 내 모든 이미지에 앙상블 적용"""
+    if not os.path.exists(input_dir):
+        print(f"입력 디렉토리가 존재하지 않음: {input_dir}")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 모델 로드
+    models = []
+    model_sizes = ['n', 's']
+    for size in model_sizes:
+        model_path = f"runs/detect/train_{size}/weights/best.pt"
+        if os.path.exists(model_path):
+            model = YOLOModel()
+            model.load(model_path)
+            models.append(model)
+    
+    if not models:
+        print("사용 가능한 모델이 없습니다.")
+        return
+    
+    # 클래스 이름
+    class_names = [
+        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
+        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
+        "견인차", "기타 특장차", "성인", "어린이",
+        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
+    ]
+    
+    # 모든 이미지 처리
+    img_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    print(f"총 {len(img_files)}개 이미지 처리 중...")
+    
+    for i, img_file in enumerate(img_files):
+        img_path = os.path.join(input_dir, img_file)
+        out_path = os.path.join(output_dir, f"ensemble_{img_file}")
+        
+        print(f"[{i+1}/{len(img_files)}] {img_file} 처리 중...")
+        img = cv2.imread(img_path)
+        
+        if img is None:
+            print(f"이미지를 읽을 수 없음: {img_path}")
+            continue
+        
+        # 앙상블 예측 수행
+        boxes = ensemble_predict(models, img)
+        
+        # 결과 시각화 및 저장
+        visualize_detection(img, boxes, class_names, save_path=out_path)
+    
+    print(f"앙상블 처리 완료. 결과 저장 경로: {output_dir}")

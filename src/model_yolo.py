@@ -1,5 +1,8 @@
 import os
 import cv2
+import random
+import shutil
+import time
 
 from ultralytics import YOLO
 
@@ -93,11 +96,23 @@ class YOLOModel:
         epochs=50,
         device=None,
         class_names=None,
-        force_retrain=False,
+        force_retrain=True,
         img_size=640,
         batch_size=None,
         project="runs/detect",
         name="train",
+        lr0=0.01,
+        lrf=0.01,
+        augment=True,
+        mosaic=1.0,
+        mixup=0.1,
+        degrees=10.0,
+        scale=0.5,
+        flipud=0.1,
+        fliplr=0.5,
+        box=7.5,
+        cls=0.5,
+        dfl=1.5
     ):
         """
         YOLO 모델을 커스텀 클래스로 학습합니다.
@@ -113,6 +128,18 @@ class YOLOModel:
             batch_size (int): 배치 크기
             project (str): 프로젝트 경로
             name (str): 학습 이름
+            lr0 (float): 초기 학습률
+            lrf (float): 최종 학습률 비율 
+            augment (bool): 데이터 증강 사용 여부
+            mosaic (float): 모자이크 증강 비율 (0.0-1.0)
+            mixup (float): 믹스업 증강 비율 (0.0-1.0)
+            degrees (float): 회전 증강 각도
+            scale (float): 크기 조정 비율
+            flipud (float): 상하 반전 확률
+            fliplr (float): 좌우 반전 확률
+            box (float): 박스 손실 가중치
+            cls (float): 클래스 손실 가중치
+            dfl (float): 분포 초점 손실 가중치
         """
         try:
             import torch
@@ -158,7 +185,7 @@ class YOLOModel:
             if batch_size is None:
                 batch_size = 8 if device == "cuda" else 4
 
-            # 학습 실행 - 프로젝트/이름 설정 추가
+            # 학습 실행 - 모든 하이퍼파라미터 전달
             results = self.model.train(
                 data=yaml_path,
                 epochs=epochs,
@@ -168,6 +195,18 @@ class YOLOModel:
                 verbose=True,
                 project=project,
                 name=name,
+                lr0=lr0,
+                lrf=lrf,
+                augment=augment,
+                mosaic=mosaic,
+                mixup=mixup,
+                degrees=degrees,
+                scale=scale,
+                flipud=flipud,
+                fliplr=fliplr,
+                box=box,
+                cls=cls,
+                dfl=dfl
             )
 
             # 학습된 모델 저장 경로
@@ -287,3 +326,91 @@ class YOLOModel:
         self.model = YOLO(path)
         self.best_weight = path
         print(f"[YOLOModel.load] 모델 로드 완료: {path}")
+
+
+def create_subset(source_dir, target_dir, sampling_ratio=0.3, min_samples=10):
+    """주요 클래스는 30% 샘플링, 소수 클래스는 전부 유지하는 전략"""
+    os.makedirs(target_dir, exist_ok=True)
+    label_files = [f for f in os.listdir(source_dir) if f.endswith('.txt')]
+    
+    print(f"\n[데이터 축소] 원본 파일 수: {len(label_files)}개")
+    print(f"[데이터 축소] 소스 경로: {source_dir}")
+    print(f"[데이터 축소] 타겟 경로: {target_dir}")
+    print(f"[데이터 축소] 샘플링 비율: {sampling_ratio*100:.1f}% (소수 클래스 100% 유지)")
+    print("-" * 60)
+    
+    # 클래스별 파일 분류
+    print("[데이터 축소] 파일 분석 중...")
+    class_files = {}
+    for i, file in enumerate(label_files):
+        if i % 1000 == 0 and i > 0:
+            print(f"  - {i}/{len(label_files)} 파일 처리 중... ({i/len(label_files)*100:.1f}%)")
+            
+        try:
+            with open(os.path.join(source_dir, file), 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if parts:
+                        class_id = int(parts[0])
+                        if class_id not in class_files:
+                            class_files[class_id] = []
+                        class_files[class_id].append(file)
+                        break  # 첫 객체의 클래스만 확인
+        except Exception as e:
+            print(f"  - 경고: 파일 {file} 처리 중 오류: {str(e)}")
+    
+    # 클래스별 샘플링
+    selected_files = set()
+    print("\n[데이터 축소] 클래스별 샘플링:")
+    print(f"{'클래스ID':<10}{'원본 수':<10}{'샘플 수':<10}{'비율':<10}")
+    print("-" * 40)
+    
+    total_orig = 0
+    total_sampled = 0
+    
+    for class_id, files in sorted(class_files.items()):
+        total_orig += len(files)
+        # 소수 클래스(경찰차 등)는 전부 포함
+        if len(files) < 150:  # 소수 클래스 기준
+            sample_size = len(files)
+            rare_class = True
+        else:
+            sample_size = max(min_samples, int(len(files) * sampling_ratio))
+            rare_class = False
+        
+        if len(files) <= sample_size:
+            samples = files
+        else:
+            samples = random.sample(files, sample_size)
+        
+        selected_files.update(samples)
+        total_sampled += len(samples)
+        
+        ratio = len(samples) / len(files) * 100 if len(files) > 0 else 0
+        status = "전체유지" if rare_class else f"{ratio:.1f}%"
+        print(f"{class_id:<10}{len(files):<10}{len(samples):<10}{status:<10}")
+    
+    # 결과 요약
+    print("-" * 40)
+    print(f"총계: {total_orig} -> {total_sampled} ({total_sampled/total_orig*100:.1f}%)")
+    
+    # 파일 복사
+    print(f"\n[데이터 축소] {len(selected_files)}개 파일 복사 중...")
+    start_time = time.time()
+    
+    for i, file in enumerate(selected_files):
+        if (i+1) % 100 == 0 or (i+1) == len(selected_files):
+            elapsed = time.time() - start_time
+            files_per_sec = (i+1) / elapsed if elapsed > 0 else 0
+            eta = (len(selected_files) - (i+1)) / files_per_sec if files_per_sec > 0 else 0
+            progress = (i+1) / len(selected_files) * 100
+            
+            print(f"  - 진행: {progress:.1f}% ({i+1}/{len(selected_files)}) - "
+                  f"속도: {files_per_sec:.1f} 파일/초, "
+                  f"남은 시간: {eta:.1f}초")
+        
+        shutil.copy2(os.path.join(source_dir, file), target_dir)
+    
+    total_time = time.time() - start_time
+    print(f"\n[데이터 축소] 완료: {len(selected_files)}개 파일 복사됨 (소요시간: {total_time:.2f}초)")
+    return len(selected_files)

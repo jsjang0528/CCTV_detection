@@ -4,14 +4,14 @@ from .model_yolo import YOLOModel
 def train_model(
     train_dir, 
     val_dir, 
-    epochs=50, 
-    model_size="n",
+    epochs=100, 
+    model_size="s",
     img_size=640,
     batch_size=None,
-    lr0=0.01,
+    lr0=0.005,
     augment=True,
     mosaic=1.0,
-    mixup=0.1
+    mixup=0.3
 ):
     """
     지정된 유형의 객체 감지 모델을 학습합니다.
@@ -74,12 +74,12 @@ def train_model(
         mosaic=mosaic,
         mixup=mixup,
         lrf=0.01,  # 최종 학습률 비율
-        degrees=10.0,
+        degrees=15.0,
         scale=0.5,
         flipud=0.1,
         fliplr=0.5,
         box=7.5,       # 박스 손실 가중치
-        cls=0.5,       # 클래스 손실 가중치
+        cls=1.5,       # 클래스 손실 가중치
         dfl=1.5,       # 분포 초점 손실 가중치
     )
 
