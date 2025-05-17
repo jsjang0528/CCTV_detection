@@ -44,18 +44,18 @@ def main():
     #     )  # JSON -> YOLO 텍스트 파일 (.txt)
 
     # 3) 모델 학습
-    print("3. 모델 학습 (YOLOv8s)")
+    print("3. 모델 학습 (YOLOv8n)")
     model = train_model(
         train_dir="data/train", 
         val_dir="data/val", 
         epochs=5,
         model_size="n",
-        img_size=416,
-        batch_size=8,
-        lr0=0.008,
+        img_size=640,
+        batch_size=16,
+        lr0=0.01,
         augment=True,
         mosaic=1.0,
-        mixup=0.2
+        mixup=0.3
     )
 
     # 4) 테스트 이미지에서 객체 감지 추론 수행

@@ -1,341 +1,511 @@
+import os
+import glob
 import numpy as np
 import cv2
-import os
+from ultralytics import YOLO
+import torch
+
 from .model_yolo import YOLOModel
 
-def non_max_suppression(boxes, iou_threshold=0.5, conf_threshold=0.25):
-    """중복 박스를 제거하는 NMS 알고리즘"""
+
+def non_max_suppression(boxes, scores, labels, iou_threshold=0.5, img_width=640, img_height=480):
+    """
+    비최대 억제(Non-Maximum Suppression) 알고리즘으로 중복 박스 제거
+    
+    매개변수:
+        boxes: 박스 좌표 배열 [x1, y1, x2, y2]
+        scores: 각 박스의 신뢰도 점수
+        labels: 각 박스의 클래스 라벨
+        iou_threshold: IoU 임계값 (기본값: 0.5)
+        img_width: 이미지 너비 (정규화된 좌표 변환용, 기본값: 640)
+        img_height: 이미지 높이 (정규화된 좌표 변환용, 기본값: 480)
+        
+    반환값:
+        선택된 박스, 점수, 라벨 인덱스
+    """
     if len(boxes) == 0:
-        return []
-        
-    # 신뢰도 기준 필터링
-    filtered_boxes = [b for b in boxes if b[4] >= conf_threshold]
-    if len(filtered_boxes) == 0:
-        return []
+        return [], [], []
     
-    # 클래스별로 처리
-    class_boxes = {}
-    for box in filtered_boxes:
-        class_id = int(box[5])
-        if class_id not in class_boxes:
-            class_boxes[class_id] = []
-        class_boxes[class_id].append(box)
+    # 픽셀 좌표로 변환 (예측이 정규화된 좌표인 경우)
+    if np.max(boxes) <= 1.0:
+        boxes = boxes.copy()
+        boxes[:, [0, 2]] *= img_width
+        boxes[:, [1, 3]] *= img_height
     
-    # 클래스별 NMS 적용
-    result_boxes = []
-    for class_id, boxes in class_boxes.items():
-        # 신뢰도 기준 내림차순 정렬
-        boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
-        picked = []
+    # 좌표 형식이 [cx, cy, w, h]인 경우 [x1, y1, x2, y2]로 변환
+    if boxes.shape[1] == 4:
+        x1 = boxes[:, 0] - boxes[:, 2] / 2
+        y1 = boxes[:, 1] - boxes[:, 3] / 2
+        x2 = boxes[:, 0] + boxes[:, 2] / 2
+        y2 = boxes[:, 1] + boxes[:, 3] / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+    
+    # 신뢰도 점수로 인덱스 정렬 (내림차순)
+    indices = np.argsort(scores)[::-1]
+    
+    keep = []  # 유지할 박스 인덱스
+    
+    while indices.size > 0:
+        # 가장 높은 점수의 박스 선택
+        i = indices[0]
+        keep.append(i)
         
-        while len(boxes) > 0:
-            # 신뢰도 최대 박스 선택
-            current = boxes[0]
-            picked.append(current)
+        # 마지막 박스면 종료
+        if indices.size == 1:
+            break
             
-            if len(boxes) == 1:
-                break
-                
-            # 남은 박스들
-            rest = boxes[1:]
-            boxes = []
-            
-            for box in rest:
-                # IoU 계산
-                x1 = max(current[0], box[0])
-                y1 = max(current[1], box[1])
-                x2 = min(current[2], box[2])
-                y2 = min(current[3], box[3])
-                
-                w = max(0, x2 - x1)
-                h = max(0, y2 - y1)
-                
-                intersection = w * h
-                box1_area = (current[2] - current[0]) * (current[3] - current[1])
-                box2_area = (box[2] - box[0]) * (box[3] - box[1])
-                union = box1_area + box2_area - intersection
-                
-                iou = intersection / union if union > 0 else 0
-                
-                # IoU가 임계값보다 작으면 유지
-                if iou < iou_threshold:
-                    boxes.append(box)
+        # 나머지 박스와 IoU 계산
+        box_i = boxes[i]
+        rest_boxes = boxes[indices[1:]]
         
-        result_boxes.extend(picked)
+        # IoU 계산
+        xx1 = np.maximum(box_i[0], rest_boxes[:, 0])
+        yy1 = np.maximum(box_i[1], rest_boxes[:, 1])
+        xx2 = np.minimum(box_i[2], rest_boxes[:, 2])
+        yy2 = np.minimum(box_i[3], rest_boxes[:, 3])
+        
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        intersection = w * h
+        
+        box_area = (box_i[2] - box_i[0]) * (box_i[3] - box_i[1])
+        rest_area = (rest_boxes[:, 2] - rest_boxes[:, 0]) * (rest_boxes[:, 3] - rest_boxes[:, 1])
+        union = box_area + rest_area - intersection
+        
+        iou = intersection / union
+        
+        # IoU 임계값보다 작은 박스만 유지
+        inds = np.where(iou <= iou_threshold)[0]
+        indices = indices[inds + 1]  # +1은 현재 박스를 건너뛰기 위함
     
-    return result_boxes
+    return boxes[keep], scores[keep], labels[keep]
 
-def ensemble_predict(models, img, conf_thresh=0.2, iou_thresh=0.5):
-    """여러 모델의 예측을 결합"""
-    all_boxes = []
+
+def ensemble_predict(models, img, conf_thresh=0.25, iou_thresh=0.5):
+    """
+    여러 YOLO 모델의 예측 결과를 앙상블하여 최종 예측 생성
+    
+    매개변수:
+        models: 모델 객체 리스트 (YOLOModel 인스턴스)
+        img: 입력 이미지 (OpenCV BGR 형식)
+        conf_thresh: 신뢰도 임계값 (기본값: 0.25)
+        iou_thresh: NMS IoU 임계값 (기본값: 0.5)
+        
+    반환값:
+        앙상블된 예측 결과 (NMS 적용 후)
+    """
+    all_predictions = []
+    
+    # 각 모델의 예측 수집
     for i, model in enumerate(models):
-        print(f"모델 {i+1}/{len(models)} 예측 중...")
-        boxes = model.predict(img, conf_thresh=conf_thresh)
-        all_boxes.extend(boxes)
+        try:
+            predictions = model.predict(img, conf_thresh=conf_thresh)
+            print(f"모델 {i+1}: {len(predictions)}개 객체 감지")
+            all_predictions.extend(predictions)
+        except Exception as e:
+            print(f"모델 {i+1} 예측 오류: {str(e)}")
     
-    # NMS로 중복 박스 제거
-    final_boxes = non_max_suppression(all_boxes, iou_threshold=iou_thresh)
-    print(f"앙상블 결과: {len(final_boxes)}개 객체 감지됨")
-    return final_boxes
-
-def transform_boxes(boxes, orig_shape, aug_shape):
-    """증강된 이미지의 박스 좌표를 원본 이미지 좌표로 변환"""
-    if not boxes:
+    if not all_predictions:
+        print("앙상블 예측 결과가 없습니다.")
         return []
-        
-    # 스케일 계산
-    orig_h, orig_w = orig_shape[:2]
-    aug_h, aug_w = aug_shape[:2]
-    w_scale = orig_w / aug_w
-    h_scale = orig_h / aug_h
     
-    transformed = []
-    for box in boxes:
-        x1, y1, x2, y2, conf, class_id = box
-        # 좌표 변환
-        x1 = x1 * w_scale
-        y1 = y1 * h_scale
-        x2 = x2 * w_scale
-        y2 = y2 * h_scale
-        
-        # 범위 제한
-        x1 = max(0, min(orig_w, x1))
-        y1 = max(0, min(orig_h, y1))
-        x2 = max(0, min(orig_w, x2))
-        y2 = max(0, min(orig_h, y2))
-        
-        transformed.append([x1, y1, x2, y2, conf, class_id])
+    # 이미지 크기 가져오기
+    h, w = img.shape[:2]
     
-    return transformed
+    # 결과 형식 변환 [x1, y1, x2, y2, confidence, class_id]
+    boxes = np.array([p[:4] for p in all_predictions])
+    scores = np.array([p[4] for p in all_predictions])
+    class_ids = np.array([p[5] for p in all_predictions])
+    
+    # NMS 적용
+    final_boxes, final_scores, final_class_ids = non_max_suppression(
+        boxes, scores, class_ids, iou_threshold=iou_thresh,
+        img_width=w, img_height=h
+    )
+    
+    # 최종 결과 형식으로 변환 [x1, y1, x2, y2, confidence, class_id]
+    final_predictions = []
+    for i in range(len(final_boxes)):
+        final_predictions.append([
+            final_boxes[i][0], final_boxes[i][1], 
+            final_boxes[i][2], final_boxes[i][3], 
+            final_scores[i], final_class_ids[i]
+        ])
+    
+    print(f"앙상블 결과: {len(final_predictions)}개 객체 감지")
+    return final_predictions
 
-def test_time_augmentation(model, img, augment_count=5):
-    """테스트 시 이미지 증강하여 예측 결과 개선"""
-    print("TTA 시작: 원본 이미지 예측...")
-    # 원본 이미지 예측
-    boxes = model.predict(img)
+
+def test_time_augmentation(model, img, augmentations=['original', 'flip_h', 'flip_v', 'rotate90'], conf_thresh=0.25, iou_thresh=0.45):
+    """
+    테스트 시간 증강(TTA)을 수행하여 예측 정확도 향상
     
-    # 다양한 증강 적용
-    augmentations = [
-        lambda x: cv2.flip(x, 1),  # 좌우 반전
-        lambda x: cv2.resize(x, (int(x.shape[1]*0.8), int(x.shape[0]*0.8))),  # 축소
-        lambda x: cv2.resize(x, (int(x.shape[1]*1.2), int(x.shape[0]*1.2))),  # 확대
-        lambda x: cv2.rotate(x, cv2.ROTATE_90_CLOCKWISE),  # 90도 회전
-        lambda x: cv2.addWeighted(x, 1.5, x, 0, 0)  # 대비 증가
-    ]
+    매개변수:
+        model: YOLOModel 인스턴스
+        img: 입력 이미지 (OpenCV BGR 형식)
+        augmentations: 적용할 증강 기법 목록
+        conf_thresh: 신뢰도 임계값
+        iou_thresh: NMS IoU 임계값
+        
+    반환값:
+        TTA 적용 후 최종 예측 결과
+    """
+    h, w = img.shape[:2]
+    all_predictions = []
     
-    all_boxes = boxes.copy()
-    print(f"원본 이미지에서 {len(boxes)}개 객체 감지됨")
-    
-    # 실제 사용할 증강 수 제한
-    used_augmentations = augmentations[:min(augment_count, len(augmentations))]
-    
-    for i, aug_func in enumerate(used_augmentations):
-        print(f"증강 {i+1}/{len(used_augmentations)} 적용 중...")
+    # 각 증강 기법에 대한 예측 수행
+    for aug in augmentations:
+        aug_img = img.copy()
+        
         # 증강 적용
-        aug_img = aug_func(img.copy())
-        # 예측
-        aug_boxes = model.predict(aug_img)
-        # 원본 이미지 좌표로 변환
-        transformed_boxes = transform_boxes(aug_boxes, img.shape, aug_img.shape)
-        all_boxes.extend(transformed_boxes)
-        print(f"  - 증강 {i+1}에서 {len(aug_boxes)}개 객체 감지됨")
+        if aug == 'flip_h':
+            aug_img = cv2.flip(aug_img, 1)  # 수평 반전
+        elif aug == 'flip_v':
+            aug_img = cv2.flip(aug_img, 0)  # 수직 반전
+        elif aug == 'rotate90':
+            aug_img = cv2.rotate(aug_img, cv2.ROTATE_90_CLOCKWISE)  # 90도 회전
+        elif aug == 'rotate180':
+            aug_img = cv2.rotate(aug_img, cv2.ROTATE_180)  # 180도 회전
+        elif aug == 'rotate270':
+            aug_img = cv2.rotate(aug_img, cv2.ROTATE_90_COUNTERCLOCKWISE)  # 270도 회전
+        elif aug == 'blur':
+            aug_img = cv2.GaussianBlur(aug_img, (5, 5), 0)  # 가우시안 블러
+        
+        # 예측 수행
+        predictions = model.predict(aug_img, conf_thresh=conf_thresh)
+        
+        # 증강 기법에 따른 좌표 역변환
+        for i, pred in enumerate(predictions):
+            x1, y1, x2, y2, conf, class_id = pred
+            
+            # 증강에 따른 좌표 변환
+            if aug == 'flip_h':
+                # x 좌표 반전
+                x1_new = w - x2
+                x2_new = w - x1
+                predictions[i][0] = x1_new
+                predictions[i][2] = x2_new
+            
+            elif aug == 'flip_v':
+                # y 좌표 반전
+                y1_new = h - y2
+                y2_new = h - y1
+                predictions[i][1] = y1_new
+                predictions[i][3] = y2_new
+            
+            elif aug == 'rotate90':
+                # 90도 회전 역변환
+                # (x,y) -> (y, w-x)
+                x1_new, y1_new = y1, w - x2
+                x2_new, y2_new = y2, w - x1
+                predictions[i][0] = min(x1_new, x2_new)
+                predictions[i][1] = min(y1_new, y2_new)
+                predictions[i][2] = max(x1_new, x2_new)
+                predictions[i][3] = max(y1_new, y2_new)
+            
+            elif aug == 'rotate180':
+                # 180도 회전 역변환
+                x1_new, y1_new = w - x2, h - y2
+                x2_new, y2_new = w - x1, h - y1
+                predictions[i][0] = x1_new
+                predictions[i][1] = y1_new
+                predictions[i][2] = x2_new
+                predictions[i][3] = y2_new
+                
+            elif aug == 'rotate270':
+                # 270도 회전 역변환
+                # (x,y) -> (h-y, x)
+                x1_new, y1_new = h - y2, x1
+                x2_new, y2_new = h - y1, x2
+                predictions[i][0] = min(x1_new, x2_new)
+                predictions[i][1] = min(y1_new, y2_new)
+                predictions[i][2] = max(x1_new, x2_new)
+                predictions[i][3] = max(y1_new, y2_new)
+        
+        # 결과 추가
+        all_predictions.extend(predictions)
     
-    # NMS로 중복 박스 제거
-    final_boxes = non_max_suppression(all_boxes, iou_threshold=0.5)
-    print(f"TTA 최종 결과: {len(final_boxes)}개 객체 감지됨")
-    return final_boxes
+    # 결과가 없으면 빈 리스트 반환
+    if not all_predictions:
+        return []
+    
+    # 좌표, 점수, 클래스 ID 분리
+    boxes = np.array([p[:4] for p in all_predictions])
+    scores = np.array([p[4] for p in all_predictions])
+    class_ids = np.array([p[5] for p in all_predictions])
+    
+    # NMS 적용하여 중복 제거
+    final_boxes, final_scores, final_class_ids = non_max_suppression(
+        boxes, scores, class_ids, iou_threshold=iou_thresh,
+        img_width=w, img_height=h
+    )
+    
+    # 최종 결과 형식으로 변환
+    final_predictions = []
+    for i in range(len(final_boxes)):
+        final_predictions.append([
+            final_boxes[i][0], final_boxes[i][1], 
+            final_boxes[i][2], final_boxes[i][3], 
+            final_scores[i], final_class_ids[i]
+        ])
+    
+    return final_predictions
 
-def visualize_detection(img, boxes, class_names=None, save_path=None):
-    """탐지 결과를 시각화"""
-    img_copy = img.copy()
+
+def visualize_detection(img, boxes, class_names=None, conf_thresh=0.3, save_path=None):
+    """
+    객체 감지 결과를 시각화하여 표시하거나 저장
     
-    # 색상 설정 (클래스별로 다른 색상)
-    colors = [
-        (0, 255, 0),    # 녹색
-        (255, 0, 0),    # 파란색
-        (0, 0, 255),    # 빨간색
-        (255, 255, 0),  # 청록색
-        (255, 0, 255),  # 자주색
-        (0, 255, 255),  # 노란색
-        (128, 128, 0),  # 올리브색
-        (128, 0, 128),  # 보라색
-        (0, 128, 128),  # 테일색
-    ]
+    매개변수:
+        img: 입력 이미지 (OpenCV BGR 형식)
+        boxes: 감지된 박스 목록 [x1, y1, x2, y2, confidence, class_id] 형식
+        class_names: 클래스 이름 목록 (없으면 클래스 ID만 표시)
+        conf_thresh: 표시할 박스의 최소 신뢰도 임계값
+        save_path: 결과 이미지 저장 경로 (None이면 화면에 표시)
+        
+    반환값:
+        시각화된 이미지 (numpy.ndarray)
+    """
+    # 클래스 이름이 없으면 기본값 사용
+    if class_names is None:
+        class_names = [
+            "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)", "통학버스(소형,대형)",
+            "경찰차", "구급차", "소방차", "견인차", "기타 특장차",
+            "성인", "어린이", "오토바이", "자전거 / 기타 전동 이동체",
+            "라바콘", "삼각대", "기타"
+        ]
     
+    # 이미지 복사
+    vis_img = img.copy()
+    
+    # 각 클래스별 색상 생성 (BGR 형식)
+    colors = {}
+    np.random.seed(42)  # 색상 일관성 유지
+    for i in range(max(17, len(class_names))):
+        colors[i] = tuple(map(int, np.random.randint(0, 255, 3)))
+    
+    # 박스 표시
     for box in boxes:
-        x1, y1, x2, y2, conf, class_id = box
-        class_id = int(class_id)
+        x1, y1, x2, y2 = map(int, box[:4])
+        conf = box[4]
+        class_id = int(box[5]) if len(box) > 5 else 0
         
-        # 좌표를 정수로 변환
-        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        # 임계값 미만 박스는 건너뛰기
+        if conf < conf_thresh:
+            continue
         
-        # 색상 선택
-        color = colors[class_id % len(colors)]
+        # 박스 색상 선택
+        color = colors.get(class_id, (0, 255, 0))  # 기본값: 녹색
         
-        # 박스 그리기
-        cv2.rectangle(img_copy, (x1, y1), (x2, y2), color, 2)
+        # 바운딩 박스 그리기
+        cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
         
-        # 클래스 이름과 신뢰도
-        label = f"{class_names[class_id] if class_names else f'Class {class_id}'}: {conf:.2f}"
+        # 클래스 이름과 신뢰도 표시
+        label = f"{class_names[class_id]}" if class_id < len(class_names) else f"클래스 {class_id}"
+        label += f": {conf:.2f}"
         
-        # 텍스트 크기 계산
-        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # 라벨 배경 그리기
+        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(vis_img, (x1, y1 - h - 5), (x1 + w, y1), color, -1)
         
-        # 텍스트 배경 그리기
-        cv2.rectangle(img_copy, (x1, y1 - text_size[1] - 5), (x1 + text_size[0], y1), color, -1)
-        
-        # 텍스트 그리기
-        cv2.putText(img_copy, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # 라벨 텍스트 그리기
+        cv2.putText(vis_img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
-    # 이미지 저장
+    # 이미지 저장 또는 표시
     if save_path:
-        cv2.imwrite(save_path, img_copy)
-        print(f"시각화된 이미지 저장됨: {save_path}")
+        cv2.imwrite(save_path, vis_img)
+        print(f"시각화 이미지 저장됨: {save_path}")
     
-    return img_copy
+    return vis_img
+
 
 def run_ensemble():
-    print("\n=== 앙상블 모델 실행 ===")
-    # 여러 크기의 모델 로드
-    models = []
+    """
+    여러 모델로 앙상블 예측을 실행하고 결과 평가
+    """
+    print("\n=== 앙상블 예측 실행 ===")
     
-    # 여러 모델 로드 (예: nano와 small 모델)
-    model_sizes = ['n', 's']  # 사용 가능한 모델 크기
-    for size in model_sizes:
-        model_path = f"runs/detect/train_{size}/weights/best.pt"
-        if os.path.exists(model_path):
-            print(f"모델 로드 중: {model_path}")
-            model = YOLOModel()
-            model.load(model_path)
-            models.append(model)
-        else:
-            print(f"모델 파일을 찾을 수 없음: {model_path}")
-    
-    if not models:
-        print("사용 가능한 모델이 없습니다. 확인 후 다시 시도하세요.")
-        return
-    
-    # 테스트 이미지 선택 (첫 번째 테스트 이미지 사용)
-    test_img_files = os.listdir("data/test/images")
-    test_img_files = [f for f in test_img_files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    
-    if not test_img_files:
-        print("테스트 이미지를 찾을 수 없습니다.")
-        return
-        
-    test_img_path = os.path.join("data/test/images", test_img_files[0])
-    print(f"테스트 이미지: {test_img_path}")
-    
-    img = cv2.imread(test_img_path)
-    ensemble_boxes = ensemble_predict(models, img)
-    
-    # 결과 시각화
-    class_names = [
-        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
-        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
-        "견인차", "기타 특장차", "성인", "어린이",
-        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
+    # 모델 경로 설정 (학습된 모델들)
+    model_paths = [
+        "runs/detect/train/weights/best.pt",
+        "runs/detect/train2/weights/best.pt"  # 가능하면 다른 모델 추가
     ]
     
-    vis_img = visualize_detection(
-        img, ensemble_boxes, class_names, 
-        save_path="ensemble_result.jpg"
-    )
-    print(f"앙상블 결과: {len(ensemble_boxes)}개 객체 감지됨, 결과 이미지: ensemble_result.jpg")
-    return ensemble_boxes
-
-def run_tta(model=None):
-    """테스트 시간 증강(TTA) 실행 예시"""
-    print("\n=== 테스트 시간 증강(TTA) 실행 ===")
+    # 사용 가능한 모델만 필터링
+    available_models = []
+    for path in model_paths:
+        if os.path.exists(path):
+            available_models.append(path)
     
-    # 모델이 전달되지 않았으면 로드
-    if model is None:
-        model_path = "runs/detect/train/weights/best.pt"
-        if not os.path.exists(model_path):
-            print(f"모델 파일을 찾을 수 없음: {model_path}")
-            return
-            
-        model = YOLOModel()
-        model.load(model_path)
-    
-    # 테스트 이미지 선택 (첫 번째 테스트 이미지 사용)
-    test_img_files = os.listdir("data/test/images")
-    test_img_files = [f for f in test_img_files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    
-    if not test_img_files:
-        print("테스트 이미지를 찾을 수 없습니다.")
+    if len(available_models) == 0:
+        print("사용 가능한 모델이 없습니다. 앙상블을 건너뜁니다.")
         return
-        
-    test_img_path = os.path.join("data/test/images", test_img_files[0])
-    print(f"테스트 이미지: {test_img_path}")
+    elif len(available_models) == 1:
+        print(f"하나의 모델만 사용 가능: {available_models[0]}")
+        print("단일 모델로 앙상블 효과를 얻을 수 없지만 계속 진행합니다.")
     
-    img = cv2.imread(test_img_path)
-    tta_boxes = test_time_augmentation(model, img)
-    
-    # 결과 시각화
-    class_names = [
-        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
-        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
-        "견인차", "기타 특장차", "성인", "어린이",
-        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
-    ]
-    
-    vis_img = visualize_detection(
-        img, tta_boxes, class_names, 
-        save_path="tta_result.jpg"
-    )
-    print(f"TTA 결과: {len(tta_boxes)}개 객체 감지됨, 결과 이미지: tta_result.jpg")
-    return tta_boxes
-
-def run_ensemble_on_directory(input_dir, output_dir):
-    """디렉토리 내 모든 이미지에 앙상블 적용"""
-    if not os.path.exists(input_dir):
-        print(f"입력 디렉토리가 존재하지 않음: {input_dir}")
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"사용할 모델: {available_models}")
     
     # 모델 로드
     models = []
-    model_sizes = ['n', 's']
-    for size in model_sizes:
-        model_path = f"runs/detect/train_{size}/weights/best.pt"
-        if os.path.exists(model_path):
+    for path in available_models:
+        try:
             model = YOLOModel()
-            model.load(model_path)
+            model.load(path)
             models.append(model)
+            print(f"모델 로드 완료: {path}")
+        except Exception as e:
+            print(f"모델 로드 실패 ({path}): {str(e)}")
     
-    if not models:
-        print("사용 가능한 모델이 없습니다.")
+    # 테스트 이미지 디렉토리
+    test_dir = "data/test/images"
+    out_dir = "data/test/labels_ensemble"
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # 테스트 이미지 목록
+    img_files = sorted(glob.glob(os.path.join(test_dir, "*.jpg")))
+    
+    if not img_files:
+        print(f"테스트 이미지가 없습니다: {test_dir}")
         return
     
-    # 클래스 이름
-    class_names = [
-        "경차/세단", "SUV/승합차", "트럭", "버스(소형, 대형)",
-        "통학버스(소형,대형)", "경찰차", "구급차", "소방차",
-        "견인차", "기타 특장차", "성인", "어린이",
-        "오토바이", "자전거 / 기타 전동 이동체", "라바콘", "삼각대", "기타"
-    ]
+    print(f"테스트 이미지 수: {len(img_files)}")
     
-    # 모든 이미지 처리
-    img_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    print(f"총 {len(img_files)}개 이미지 처리 중...")
-    
-    for i, img_file in enumerate(img_files):
-        img_path = os.path.join(input_dir, img_file)
-        out_path = os.path.join(output_dir, f"ensemble_{img_file}")
+    # 각 이미지에 대해 앙상블 예측 수행
+    for i, img_path in enumerate(img_files):
+        if i % 10 == 0:
+            print(f"처리 중: {i+1}/{len(img_files)}")
         
-        print(f"[{i+1}/{len(img_files)}] {img_file} 처리 중...")
+        # 이미지 로드
         img = cv2.imread(img_path)
-        
         if img is None:
-            print(f"이미지를 읽을 수 없음: {img_path}")
+            print(f"이미지를 로드할 수 없습니다: {img_path}")
             continue
         
-        # 앙상블 예측 수행
-        boxes = ensemble_predict(models, img)
+        # 이미지 크기 (YOLO 좌표 정규화에 사용)
+        h, w = img.shape[:2]
         
-        # 결과 시각화 및 저장
-        visualize_detection(img, boxes, class_names, save_path=out_path)
+        # 앙상블 예측
+        ensemble_results = ensemble_predict(models, img, conf_thresh=0.2, iou_thresh=0.45)
+        
+        # 결과 저장 (YOLO 형식)
+        base_name = os.path.basename(img_path)
+        base_name = os.path.splitext(base_name)[0]
+        out_path = os.path.join(out_dir, f"{base_name}.txt")
+        
+        with open(out_path, 'w') as f:
+            for box in ensemble_results:
+                x1, y1, x2, y2, conf, class_id = box
+                
+                # 픽셀 좌표를 YOLO 형식으로 변환
+                x_center = (x1 + x2) / 2 / w
+                y_center = (y1 + y2) / 2 / h
+                width = (x2 - x1) / w
+                height = (y2 - y1) / h
+                
+                # YOLO 형식으로 저장
+                f.write(f"{int(class_id)} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {conf:.6f}\n")
     
-    print(f"앙상블 처리 완료. 결과 저장 경로: {output_dir}")
+    # 결과 평가
+    gt_dir = "data/test/labels"
+    print("\n=== 앙상블 예측 결과 평가 ===")
+    
+    from .evaluate import evaluate_detection
+    metrics = evaluate_detection(gt_dir, out_dir, debug=True)
+    
+    print(f"\n앙상블 평가 결과:")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"F1 Score: {metrics['f1']:.4f}")
+    print(f"mAP@0.5: {metrics['mAP@0.5']:.4f}")
+
+
+def run_tta():
+    """
+    Test-Time Augmentation을 실행하고 결과 평가
+    """
+    print("\n=== TTA 예측 실행 ===")
+    
+    # 모델 경로
+    model_path = "runs/detect/train/weights/best.pt"
+    
+    if not os.path.exists(model_path):
+        print(f"모델 파일이 없습니다: {model_path}")
+        return
+    
+    # 모델 로드
+    try:
+        model = YOLOModel()
+        model.load(model_path)
+        print(f"모델 로드 완료: {model_path}")
+    except Exception as e:
+        print(f"모델 로드 실패: {str(e)}")
+        return
+    
+    # 테스트 이미지 디렉토리
+    test_dir = "data/test/images"
+    out_dir = "data/test/labels_tta"
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # 테스트 이미지 목록
+    img_files = sorted(glob.glob(os.path.join(test_dir, "*.jpg")))
+    
+    if not img_files:
+        print(f"테스트 이미지가 없습니다: {test_dir}")
+        return
+    
+    print(f"테스트 이미지 수: {len(img_files)}")
+    
+    # 증강 기법 목록
+    augmentations = ['original', 'flip_h', 'flip_v', 'rotate90']
+    
+    # 각 이미지에 대해 TTA 수행
+    for i, img_path in enumerate(img_files):
+        if i % 10 == 0:
+            print(f"처리 중: {i+1}/{len(img_files)}")
+        
+        # 이미지 로드
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"이미지를 로드할 수 없습니다: {img_path}")
+            continue
+        
+        # 이미지 크기
+        h, w = img.shape[:2]
+        
+        # TTA 예측
+        tta_results = test_time_augmentation(
+            model, img, augmentations=augmentations, 
+            conf_thresh=0.2, iou_thresh=0.45
+        )
+        
+        # 결과 저장 (YOLO 형식)
+        base_name = os.path.basename(img_path)
+        base_name = os.path.splitext(base_name)[0]
+        out_path = os.path.join(out_dir, f"{base_name}.txt")
+        
+        with open(out_path, 'w') as f:
+            for box in tta_results:
+                x1, y1, x2, y2, conf, class_id = box
+                
+                # 픽셀 좌표를 YOLO 형식으로 변환
+                x_center = (x1 + x2) / 2 / w
+                y_center = (y1 + y2) / 2 / h
+                width = (x2 - x1) / w
+                height = (y2 - y1) / h
+                
+                # YOLO 형식으로 저장
+                f.write(f"{int(class_id)} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {conf:.6f}\n")
+    
+    # 결과 평가
+    gt_dir = "data/test/labels"
+    print("\n=== TTA 예측 결과 평가 ===")
+    
+    from .evaluate import evaluate_detection
+    metrics = evaluate_detection(gt_dir, out_dir, debug=True)
+    
+    print(f"\nTTA 평가 결과:")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"F1 Score: {metrics['f1']:.4f}")
+    print(f"mAP@0.5: {metrics['mAP@0.5']:.4f}")
