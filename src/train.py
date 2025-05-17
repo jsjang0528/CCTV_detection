@@ -4,7 +4,7 @@ from .model_yolo import YOLOModel
 def train_model(
     train_dir, 
     val_dir, 
-    epochs=100, 
+    epochs=1, 
     model_size="s",
     img_size=640,
     batch_size=None,
@@ -62,7 +62,7 @@ def train_model(
     model_name = f"yolov8{model_size}.pt"
     
     yolom = YOLOModel(model_name=model_name)
-    results = yolom.train(
+    results= yolom.train(
         train_dir,
         val_dir,
         epochs=epochs,
