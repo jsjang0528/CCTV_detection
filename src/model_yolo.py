@@ -3,6 +3,7 @@ import cv2
 import random
 import shutil
 import time
+import torch
 
 from ultralytics import YOLO
 
@@ -19,7 +20,7 @@ class YOLOModel:
     YOLO는 단일 스테이지 객체 감지 알고리즘으로, 빠른 추론 속도와 높은 정확도를 제공합니다.
     """
 
-    def __init__(self, model_name="yolov8n.pt", device="auto"):
+    def __init__(self, model_name="yolov8n.pt", device="cuda"):
         """
         YOLOv8 모델을 초기화합니다.
 
@@ -34,7 +35,7 @@ class YOLOModel:
             device (str): 모델 실행 장치
                 - "auto": 자동 선택 (CUDA 사용 가능시 GPU, 아니면 CPU)
                 - "cpu": CPU만 사용
-                - "cuda": GPU 사용 (CUDA 지원 필요)
+                - "cuda": GPU 사용 (CUDA 지원 필요, 기본값)
                 - "0" 또는 "1": 특정 GPU 장치 지정
 
         참고:
@@ -157,9 +158,13 @@ class YOLOModel:
                 self.model_name = best_weight_path
                 return best_weight_path
 
-            # 장치 설정
-            if device is None:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+            # 장치 설정 - CUDA 강제 사용
+            device = "cuda"
+            if not torch.cuda.is_available():
+                print("[YOLOModel] 경고: CUDA를 사용할 수 없습니다. CPU를 대신 사용합니다.")
+                device = "cpu"
+            else:
+                print("[YOLOModel] CUDA GPU를 사용합니다.")
 
             print(f"[YOLOModel] YOLO 모델 학습 시작")
             print(f"[YOLOModel] 장치: {device}")
@@ -221,7 +226,7 @@ class YOLOModel:
             print(f"[YOLOModel] 학습 중 오류 발생: {str(e)}")
             return None
 
-    def predict(self, img_bgr, conf_thresh=0.25):
+    def predict(self, img_bgr, conf_thresh=0.3):
         """
         이미지에서 객체를 감지합니다.
 
@@ -234,6 +239,14 @@ class YOLOModel:
                 - 각 항목은 [x1, y1, x2, y2, score, class_id] 형식
                 - class_id: 객체 클래스 ID (0-16)
         """
+        # CUDA 사용 가능 여부 확인
+        if torch.cuda.is_available():
+            print("[YOLOModel.predict] CUDA GPU를 사용합니다.")
+            device = "cuda"
+        else:
+            print("[YOLOModel.predict] 경고: CUDA를 사용할 수 없습니다. CPU를 대신 사용합니다.")
+            device = "cpu"
+            
         # 필요시 모델 로드 (지연 로딩)
         if self.model is None:
             if self.best_weight and os.path.exists(self.best_weight):
@@ -245,8 +258,8 @@ class YOLOModel:
                 print(f"[YOLOModel.predict] 사전 훈련된 모델 로드: {self.model_name}")
                 self.model = YOLO(self.model_name)
 
-        # 객체 감지 수행
-        results = self.model.predict(img_bgr, conf=conf_thresh)
+        # 객체 감지 수행 (장치 명시적 지정)
+        results = self.model.predict(img_bgr, conf=conf_thresh, device=device)
         result = results[0]  # 첫 번째 이미지 결과
 
         # 결과를 표준 형식으로 변환 [x1, y1, x2, y2, score, class_id]
@@ -319,13 +332,20 @@ class YOLOModel:
                 f"[YOLOModel.load] 모델 파일을 찾을 수 없습니다: {path}"
             )
 
+        # CUDA 사용 가능 여부 확인
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+
         # 기존 모델 해제 및 새 모델 로드
         if self.model is not None:
             del self.model  # 기존 모델 메모리 해제
 
         self.model = YOLO(path)
+        self.model.to(device)  # 모델을 지정된 장치로 이동
         self.best_weight = path
-        print(f"[YOLOModel.load] 모델 로드 완료: {path}")
+        print(f"[YOLOModel.load] 모델 로드 완료: {path} (장치: {device})")
 
 
 def create_subset(source_dir, target_dir, sampling_ratio=0.3, min_samples=10):

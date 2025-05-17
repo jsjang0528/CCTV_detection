@@ -79,7 +79,7 @@ def train_model(
         flipud=0.1,
         fliplr=0.5,
         box=7.5,       # 박스 손실 가중치
-        cls=1.5,       # 클래스 손실 가중치
+        cls=2.0,       # 클래스 손실 가중치
         dfl=1.5,       # 분포 초점 손실 가중치
     )
 

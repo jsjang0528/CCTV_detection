@@ -92,7 +92,7 @@ def inference_yolo(yolo_model, test_dir, out_label_dir=None):
         h, w, _ = processed_img.shape
 
         # YOLO 모델로 객체 감지 (전처리된 이미지 사용)
-        results = yolo_model.predict(processed_img, conf_thresh=0.25)
+        results = yolo_model.predict(processed_img, conf_thresh=0.3)
 
         # 결과를 YOLO 형식으로 변환
         lines = []
