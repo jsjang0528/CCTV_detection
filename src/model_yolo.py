@@ -94,25 +94,25 @@ class YOLOModel:
         self,
         train_dir,
         val_dir=None,
-        epochs=50,
+        epochs=10,
         device=None,
         class_names=None,
         force_retrain=True,
         img_size=640,
-        batch_size=None,
+        batch_size=16,
         project="runs/detect",
         name="train",
-        lr0=0.01,
+        lr0=0.005,
         lrf=0.01,
         augment=True,
         mosaic=1.0,
-        mixup=0.1,
-        degrees=10.0,
-        scale=0.5,
+        mixup=0.5,
+        degrees=20.0,
+        scale=0.6,
         flipud=0.1,
-        fliplr=0.5,
+        fliplr=0.6,
         box=7.5,
-        cls=0.5,
+        cls=4.0,
         dfl=1.5
     ):
         """
@@ -226,7 +226,7 @@ class YOLOModel:
             print(f"[YOLOModel] 학습 중 오류 발생: {str(e)}")
             return None
 
-    def predict(self, img_bgr, conf_thresh=0.3):
+    def predict(self, img_bgr, conf_thresh=0.2):
         """
         이미지에서 객체를 감지합니다.
 

@@ -11,7 +11,7 @@ def train_model(
     lr0=0.005,
     augment=True,
     mosaic=1.0,
-    mixup=0.3
+    mixup=0.5
 ):
     """
     지정된 유형의 객체 감지 모델을 학습합니다.

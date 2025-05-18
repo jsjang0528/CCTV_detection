@@ -51,11 +51,11 @@ def main():
         epochs=5,
         model_size="n",
         img_size=640,
-        batch_size=16,
-        lr0=0.01,
+        batch_size=32,
+        lr0=0.005,
         augment=True,
         mosaic=1.0,
-        mixup=0.3
+        mixup=0.5
     )
 
     # 4) 테스트 이미지에서 객체 감지 추론 수행
